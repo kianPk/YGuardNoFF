@@ -1,35 +1,44 @@
+using System.Collections.Concurrent;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json.Serialization;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes.Registration;
+using CounterStrikeSharp.API.Modules.Utils;
 using Microsoft.Extensions.Logging;
 
 namespace YGuardNoFF;
 
 /// <summary>
-/// Applies panel gameplay prefs (friendly fire + bunny hop) on Public/Custom
-/// dedicated servers. Defaults to FF off / bhop off when the panel is unreachable.
+/// Panel gameplay prefs on Public/Custom dedicated servers:
+/// friendly fire, auto bunny hop, and hold-E parachute (slow fall).
 /// Ranked match pods and Practice are left alone.
 /// </summary>
 public class YGuardNoFFPlugin : BasePlugin
 {
     public override string ModuleName => "YGuard No Friendly Fire";
-    public override string ModuleVersion => "1.1.0";
+    public override string ModuleVersion => "1.2.1";
     public override string ModuleAuthor => "YGuard";
     public override string ModuleDescription =>
-        "Panel-driven friendly fire and bunny hop on non-Ranked dedicated servers";
+        "Panel-driven FF, bunny hop, and hold-E parachute on public servers";
+
+    /// <summary>Target downward speed while parachuting (units/s).</summary>
+    private const float ParachuteFallSpeed = -100f;
 
     private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(6) };
 
     private bool _active;
     private bool _friendlyFire;
     private bool _bunnyHop;
+    private bool _parachute;
     private string? _baseUrl;
     private string? _serverId;
     private string? _password;
     private CounterStrikeSharp.API.Modules.Timers.Timer? _poll;
+
+    /// <summary>Slot indexes currently under reduced gravity for parachute.</summary>
+    private readonly ConcurrentDictionary<int, bool> _paraActive = new();
 
     public override void Load(bool hotReload)
     {
@@ -62,8 +71,10 @@ public class YGuardNoFFPlugin : BasePlugin
 
         RegisterListener<Listeners.OnMapStart>(_map =>
         {
+            ClearParachuteGravity();
             _ = SyncAndApplyAsync();
         });
+        RegisterListener<Listeners.OnTick>(OnTick);
         RegisterEventHandler<EventRoundStart>((_, _) =>
         {
             ApplyLocal();
@@ -74,8 +85,32 @@ public class YGuardNoFFPlugin : BasePlugin
             ApplyLocal();
             return HookResult.Continue;
         });
+        RegisterEventHandler<EventPlayerDeath>((@event, _) =>
+        {
+            var player = @event.Userid;
+            if (player is not null && player.IsValid)
+            {
+                StopParachute(player);
+            }
+            return HookResult.Continue;
+        });
+        RegisterEventHandler<EventPlayerDisconnect>((@event, info) =>
+        {
+            var player = @event.Userid;
+            if (player is not null && player.IsValid)
+            {
+                _paraActive.TryRemove(player.Slot, out var _removed);
+            }
+            return HookResult.Continue;
+        });
 
-        _poll = AddTimer(30f, () => { _ = SyncAndApplyAsync(); },
+        // Instant panel apply (same pattern as css_yadmin_reload).
+        AddCommand(
+            "css_yguard_nof_reload",
+            "Reload YGuardNoFF gameplay prefs from the panel",
+            (player, info) => { _ = SyncAndApplyAsync(); });
+
+        _poll = AddTimer(15f, () => { _ = SyncAndApplyAsync(); },
             CounterStrikeSharp.API.Modules.Timers.TimerFlags.REPEAT);
 
         _ = SyncAndApplyAsync();
@@ -83,8 +118,98 @@ public class YGuardNoFFPlugin : BasePlugin
 
     public override void Unload(bool hotReload)
     {
+        if (_active)
+        {
+            RemoveListener<Listeners.OnTick>(OnTick);
+            ClearParachuteGravity();
+        }
         _poll?.Kill();
         _poll = null;
+    }
+
+    private void OnTick()
+    {
+        if (!_active) return;
+
+        foreach (var player in Utilities.GetPlayers())
+        {
+            if (player is null || !player.IsValid || player.IsBot || !player.PawnIsAlive)
+            {
+                continue;
+            }
+
+            var pawn = player.PlayerPawn.Value;
+            if (pawn is null || !pawn.IsValid)
+            {
+                continue;
+            }
+
+            var holdingUse = (player.Buttons & PlayerButtons.Use) != 0;
+            var airborne = !pawn.OnGroundLastTick;
+
+            if (_parachute && holdingUse && airborne)
+            {
+                StartParachute(player, pawn);
+            }
+            else if (_paraActive.ContainsKey(player.Slot))
+            {
+                StopParachute(player);
+            }
+        }
+    }
+
+    private void StartParachute(CCSPlayerController player, CCSPlayerPawn pawn)
+    {
+        if (!_paraActive.ContainsKey(player.Slot))
+        {
+            _paraActive[player.Slot] = true;
+            player.GravityScale = 0.1f;
+        }
+
+        var vel = pawn.AbsVelocity;
+        if (vel.Z >= 0f)
+        {
+            return;
+        }
+
+        // Clamp fall speed (same approach as Franc1sco CS2-Parachute).
+        if (vel.Z < ParachuteFallSpeed)
+        {
+            vel.Z = ParachuteFallSpeed;
+        }
+
+        var origin = pawn.AbsOrigin;
+        var angles = pawn.AbsRotation;
+        if (origin is not null && angles is not null)
+        {
+            pawn.Teleport(origin, angles, vel);
+        }
+    }
+
+    private void StopParachute(CCSPlayerController player)
+    {
+        if (!_paraActive.TryRemove(player.Slot, out _))
+        {
+            return;
+        }
+
+        if (player.IsValid)
+        {
+            player.GravityScale = 1.0f;
+        }
+    }
+
+    private void ClearParachuteGravity()
+    {
+        foreach (var slot in _paraActive.Keys.ToArray())
+        {
+            var player = Utilities.GetPlayerFromSlot(slot);
+            if (player is not null && player.IsValid)
+            {
+                player.GravityScale = 1.0f;
+            }
+        }
+        _paraActive.Clear();
     }
 
     private async Task SyncAndApplyAsync()
@@ -94,8 +219,22 @@ public class YGuardNoFFPlugin : BasePlugin
             var prefs = await FetchPrefsAsync();
             if (prefs != null)
             {
+                var wasPara = _parachute;
                 _friendlyFire = prefs.FriendlyFire;
                 _bunnyHop = prefs.BunnyHop;
+                _parachute = prefs.Parachute;
+                if (wasPara != _parachute)
+                {
+                    Logger.LogInformation(
+                        "YGuardNoFF parachute={Parachute} ff={Ff} bhop={Bhop}",
+                        _parachute,
+                        _friendlyFire,
+                        _bunnyHop);
+                    if (!_parachute)
+                    {
+                        Server.NextFrame(ClearParachuteGravity);
+                    }
+                }
             }
         }
         catch (Exception ex)
@@ -165,5 +304,8 @@ public class YGuardNoFFPlugin : BasePlugin
 
         [JsonPropertyName("bunny_hop")]
         public bool BunnyHop { get; set; }
+
+        [JsonPropertyName("parachute")]
+        public bool Parachute { get; set; }
     }
 }
