@@ -3,6 +3,8 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
+using CounterStrikeSharp.API.Modules.Commands;
+using CounterStrikeSharp.API.Modules.Memory;
 using CounterStrikeSharp.API.Modules.Utils;
 using Microsoft.Extensions.Logging;
 
@@ -17,10 +19,10 @@ namespace YGuardNoFF;
 public class YGuardNoFFPlugin : BasePlugin
 {
     public override string ModuleName => "YGuard No Friendly Fire";
-    public override string ModuleVersion => "1.2.4";
+    public override string ModuleVersion => "1.2.5";
     public override string ModuleAuthor => "YGuard";
     public override string ModuleDescription =>
-        "Panel-driven FF, bunny hop, and hold-E parachute on public servers";
+        "Panel-driven FF, bunny hop, parachute, and anti-noclip on public servers";
 
     private const float FallSpeed = 100f;
     private const float DecreaseVec = 50f;
@@ -109,9 +111,28 @@ public class YGuardNoFFPlugin : BasePlugin
             }
         }
 
+        // Block bind/noclip for everyone on public — Practice keeps it for utility.
+        var blockNoclip = !string.Equals(
+            serverType,
+            "Practice",
+            StringComparison.OrdinalIgnoreCase);
+        if (blockNoclip)
+        {
+            AddCommandListener("noclip", OnNoclipCommand, HookMode.Pre);
+            AddCommandListener("css_noclip", OnNoclipCommand, HookMode.Pre);
+            AddCommandListener("sm_noclip", OnNoclipCommand, HookMode.Pre);
+            AddTimer(20f, () => Server.ExecuteCommand("sv_cheats 0"),
+                CounterStrikeSharp.API.Modules.Timers.TimerFlags.REPEAT);
+            Server.ExecuteCommand("sv_cheats 0");
+        }
+
         RegisterListener<Listeners.OnMapStart>(mapName =>
         {
             StopAllParachutes();
+            if (blockNoclip)
+            {
+                Server.ExecuteCommand("sv_cheats 0");
+            }
             _ = SyncAndApplyAsync();
         });
         RegisterListener<Listeners.OnTick>(OnTick);
@@ -220,27 +241,54 @@ public class YGuardNoFFPlugin : BasePlugin
         _paraTicks.TryAdd(index, 0);
     }
 
+    private HookResult OnNoclipCommand(CCSPlayerController? player, CommandInfo info)
+    {
+        if (!_active) return HookResult.Continue;
+        if (player is null || !player.IsValid || player.IsBot) return HookResult.Continue;
+        player.PrintToChat(" \x02[YGuard]\x01 Noclip is disabled on this server.");
+        return HookResult.Handled;
+    }
+
+    private static void StripNoclip(CCSPlayerPawn pawn)
+    {
+        pawn.MoveType = MoveType_t.MOVETYPE_WALK;
+        Schema.SetSchemaValue(pawn.Handle, "CBaseEntity", "m_nActualMoveType", (byte)MoveType_t.MOVETYPE_WALK);
+        Utilities.SetStateChanged(pawn, "CBaseEntity", "m_MoveType");
+    }
+
     private void OnTick()
     {
-        if (!_active || !_parachute)
+        if (!_active)
         {
             return;
         }
 
         foreach (var player in Utilities.GetPlayers())
         {
-            if (player is null || !player.IsValid || player.IsBot || !player.PawnIsAlive)
+            if (player is null || !player.IsValid || player.IsBot)
+            {
+                continue;
+            }
+
+            var pawn = player.PlayerPawn.Value;
+            if (pawn is null || !pawn.IsValid)
+            {
+                continue;
+            }
+
+            // Always strip engine/plugin noclip on public — even if parachute is off.
+            if (pawn.MoveType == MoveType_t.MOVETYPE_NOCLIP)
+            {
+                StripNoclip(pawn);
+            }
+
+            if (!_parachute || !player.PawnIsAlive)
             {
                 continue;
             }
 
             EnsureParaState(player);
             var index = (int)player.Index;
-            var pawn = player.PlayerPawn.Value;
-            if (pawn is null || !pawn.IsValid)
-            {
-                continue;
-            }
 
             if (IsHoldingUse(player, pawn) && IsAirborne(pawn))
             {
@@ -495,6 +543,7 @@ public class YGuardNoFFPlugin : BasePlugin
 
             Server.ExecuteCommand($"sv_autobunnyhopping {(_bunnyHop ? "1" : "0")}");
             Server.ExecuteCommand($"sv_enablebunnyhopping {(_bunnyHop ? "1" : "0")}");
+            Server.ExecuteCommand("sv_cheats 0");
         });
     }
 
